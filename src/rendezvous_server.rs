@@ -579,6 +579,15 @@ impl RendezvousServer {
                         Ok(None) => {}
                         Err(e) => log::warn!("handle_register_pk over tcp/ws failed: {}", e),
                     }
+                    // NB: without this, execution falls through to the function's
+                    // trailing `false`, which makes the caller's while-loop break and
+                    // drop the WS/TCP sink immediately after we just sent the response
+                    // — the client sees an abrupt reset instead of the RegisterPkResponse
+                    // (confirmed via hbbs debug logs: response was built and the DB
+                    // lookup ran, but the connection closed right after with no clean
+                    // WS close handshake). Keep the connection open like PunchHoleRequest
+                    // and RequestRelay do, so the client can keep using it afterwards.
+                    return true;
                 }
                 _ => {}
             }
