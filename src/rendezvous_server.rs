@@ -485,6 +485,16 @@ impl RendezvousServer {
         }
         if changed {
             self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+        } else {
+            // update_pk() is the only place that refreshes last_reg_time, and it's
+            // only called when uuid/pk/ip changed. A peer that keeps re-registering
+            // with unchanged data (e.g. our TCP/WS clients, which re-register on every
+            // fresh connection rather than a single long-lived UDP session) would
+            // otherwise never bump last_reg_time again after the first registration,
+            // so handle_punch_hole_request's REG_TIMEOUT check would eventually mark
+            // a genuinely-online peer as OFFLINE (confirmed: reproduced with a target
+            // re-registering every ~15s, still reported offline after ~30s).
+            peer.write().await.last_reg_time = Instant::now();
         }
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_register_pk_response(RegisterPkResponse {
