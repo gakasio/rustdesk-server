@@ -82,6 +82,14 @@ struct Inner {
 #[derive(Clone)]
 pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    // Live TCP/WS sinks of peers that registered over TCP/WS, keyed by peer id
+    // rather than socket address (unlike tcp_punch, which tracks the transient
+    // connection of whoever is *initiating* a punch/relay request). Needed
+    // because delivering a punch-hole notification to a peer that only ever
+    // registers over TCP/WS (never UDP) previously always went out via the
+    // UDP-only io_loop socket (Data::Msg) and silently vanished — see
+    // deliver_to_peer().
+    ws_peers: Arc<Mutex<HashMap<String, Sink>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -129,6 +137,7 @@ impl RendezvousServer {
         };
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            ws_peers: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -340,7 +349,7 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    if let Some(msg_out) = self.handle_register_pk(rk, addr).await? {
+                    if let Some((msg_out, _ok)) = self.handle_register_pk(rk, addr).await? {
                         socket.send(&msg_out, addr).await?
                     }
                 }
@@ -402,22 +411,25 @@ impl RendezvousServer {
     // Shared RegisterPk logic for both the UDP path (handle_udp) and the TCP/WS
     // path (handle_tcp). Returns Ok(None) when the request is malformed and should
     // be silently dropped (matches historical UDP behavior), otherwise the
-    // RegisterPkResponse to send back to `addr`.
+    // RegisterPkResponse to send back to `addr` plus whether registration
+    // actually succeeded (OK) as opposed to UUID_MISMATCH/TOO_FREQUENT — callers
+    // on the TCP/WS path use the success flag to decide whether to keep this
+    // peer's sink around in ws_peers for later punch-hole delivery.
     #[inline]
     async fn handle_register_pk(
         &mut self,
         rk: RegisterPk,
         addr: SocketAddr,
-    ) -> ResultType<Option<RendezvousMessage>> {
+    ) -> ResultType<Option<(RendezvousMessage, bool)>> {
         if rk.uuid.is_empty() || rk.pk.is_empty() {
             return Ok(None);
         }
         let id = rk.id;
         let ip = addr.ip().to_string();
         if id.len() < 6 {
-            return Ok(Some(build_rk_res(UUID_MISMATCH)));
+            return Ok(Some((build_rk_res(UUID_MISMATCH), false)));
         } else if !self.check_ip_blocker(&ip, &id).await {
-            return Ok(Some(build_rk_res(TOO_FREQUENT)));
+            return Ok(Some((build_rk_res(TOO_FREQUENT), false)));
         }
         let peer = self.pm.get_or(&id).await;
         let (changed, ip_changed) = {
@@ -436,7 +448,7 @@ impl RendezvousServer {
                             peer.pk,
                         );
                         drop(peer);
-                        return Ok(Some(build_rk_res(UUID_MISMATCH)));
+                        return Ok(Some((build_rk_res(UUID_MISMATCH), false)));
                     }
                 } else {
                     log::warn!(
@@ -446,7 +458,7 @@ impl RendezvousServer {
                         peer.uuid
                     );
                     drop(peer);
-                    return Ok(Some(build_rk_res(UUID_MISMATCH)));
+                    return Ok(Some((build_rk_res(UUID_MISMATCH), false)));
                 }
                 let ip_changed = peer.info.ip != ip;
                 (
@@ -459,7 +471,7 @@ impl RendezvousServer {
         if req_pk.1.elapsed().as_secs() > 6 {
             req_pk.0 = 0;
         } else if req_pk.0 > 2 {
-            return Ok(Some(build_rk_res(TOO_FREQUENT)));
+            return Ok(Some((build_rk_res(TOO_FREQUENT), false)));
         }
         req_pk.0 += 1;
         req_pk.1 = Instant::now();
@@ -501,7 +513,31 @@ impl RendezvousServer {
             result: register_pk_response::Result::OK.into(),
             ..Default::default()
         });
-        Ok(Some(msg_out))
+        Ok(Some((msg_out, true)))
+    }
+
+    // Sends `msg` to peer `id`'s live TCP/WS connection if it has one (the
+    // normal case for our WS-only clients), falling back to the legacy
+    // UDP-only Data::Msg delivery (io_loop's socket.send) otherwise — that
+    // fallback is what every punch/relay delivery used unconditionally before
+    // this fix, which silently dropped notifications for any peer that never
+    // registers over raw UDP.
+    #[inline]
+    async fn deliver_to_peer(&self, id: &str, msg: RendezvousMessage, fallback_addr: SocketAddr) {
+        let existing = self.ws_peers.lock().await.remove(id);
+        if let Some(mut sink) = existing {
+            if let Ok(bytes) = msg.write_to_bytes() {
+                let sent = match &mut sink {
+                    Sink::TcpStream(s) => s.send(Bytes::from(bytes)).await.is_ok(),
+                    Sink::Ws(ws) => ws.send(tungstenite::Message::Binary(bytes)).await.is_ok(),
+                };
+                if sent {
+                    self.ws_peers.lock().await.insert(id.to_owned(), sink);
+                    return;
+                }
+            }
+        }
+        self.tx.send(Data::Msg(msg.into(), fallback_addr)).ok();
     }
 
     #[inline]
@@ -528,12 +564,13 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                    let peer_id = rf.id.clone();
+                    if let Some(peer) = self.pm.get_in_memory(&peer_id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        self.deliver_to_peer(&peer_id, msg_out, peer_addr).await;
                     }
                     return true;
                 }
@@ -584,8 +621,20 @@ impl RendezvousServer {
                     // traverse DPI that blocks raw UDP) could never register/confirm their
                     // key. handle_register_pk() now holds the shared logic so both
                     // transports register the same way.
+                    let id = rk.id.clone();
                     match self.handle_register_pk(rk, addr).await {
-                        Ok(Some(msg_out)) => Self::send_to_sink(sink, msg_out).await,
+                        Ok(Some((msg_out, is_ok))) => {
+                            Self::send_to_sink(sink, msg_out).await;
+                            // Keep this connection's sink around keyed by peer id so
+                            // deliver_to_peer() can push punch-hole/relay notifications
+                            // to this peer later, on whatever future connection it's
+                            // still holding open (see ws_peers doc comment).
+                            if is_ok {
+                                if let Some(s) = sink.take() {
+                                    self.ws_peers.lock().await.insert(id, s);
+                                }
+                            }
+                        }
                         Ok(None) => {}
                         Err(e) => log::warn!("handle_register_pk over tcp/ws failed: {}", e),
                     }
@@ -722,7 +771,7 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
-    ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
+    ) -> ResultType<(RendezvousMessage, Option<SocketAddr>, Option<String>)> {
         let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
@@ -731,7 +780,7 @@ impl RendezvousServer {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
                 ..Default::default()
             });
-            return Ok((msg_out, None));
+            return Ok((msg_out, None, None));
         }
         let id = ph.id;
         // punch hole request from A, relay to B,
@@ -750,7 +799,7 @@ impl RendezvousServer {
                     failure: punch_hole_response::Failure::OFFLINE.into(),
                     ..Default::default()
                 });
-                return Ok((msg_out, None));
+                return Ok((msg_out, None, None));
             }
             
             // record punch hole request (from addr -> peer id/peer_addr)
@@ -815,14 +864,14 @@ impl RendezvousServer {
                     ..Default::default()
                 });
             }
-            Ok((msg_out, Some(peer_addr)))
+            Ok((msg_out, Some(peer_addr), Some(id)))
         } else {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::ID_NOT_EXIST.into(),
                 ..Default::default()
             });
-            Ok((msg_out, None))
+            Ok((msg_out, None, None))
         }
     }
 
@@ -898,9 +947,12 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
-        if let Some(addr) = to_addr {
-            self.tx.send(Data::Msg(msg.into(), addr))?;
+        let (msg, to_addr, to_id) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
+        if let Some(peer_addr) = to_addr {
+            match to_id {
+                Some(id) => self.deliver_to_peer(&id, msg, peer_addr).await,
+                None => self.tx.send(Data::Msg(msg.into(), peer_addr))?,
+            }
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
@@ -914,14 +966,14 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
-        self.tx.send(Data::Msg(
-            msg.into(),
-            match to_addr {
-                Some(addr) => addr,
-                None => addr,
-            },
-        ))?;
+        let (msg, to_addr, to_id) = self.handle_punch_hole_request(addr, ph, key, false).await?;
+        let dest_addr = to_addr.unwrap_or(addr);
+        match to_id {
+            Some(id) if to_addr.is_some() => self.deliver_to_peer(&id, msg, dest_addr).await,
+            _ => {
+                self.tx.send(Data::Msg(msg.into(), dest_addr))?;
+            }
+        }
         Ok(())
     }
 
@@ -1217,7 +1269,12 @@ impl RendezvousServer {
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
-            while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
+            // Longer than the other (short-lived, single-exchange) TCP path below:
+            // a successfully RegisterPk'd peer's sink lives in ws_peers for as long as
+            // this connection stays open, so closing it after the same 30s idle
+            // timeout as a one-shot TCP punch/relay exchange made registered peers
+            // unreachable for punch-hole delivery far too often.
+            while let Ok(Some(Ok(msg))) = timeout(90_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
                     if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                         break;
