@@ -35,7 +35,7 @@ use sodiumoxide::crypto::sign;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     sync::Arc,
     time::Instant,
 };
@@ -60,6 +60,10 @@ static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
+// Monotonic per-TCP/WS-connection id, used to guard ws_peers cleanup so a
+// stale connection closing later can't evict a newer connection's sink for
+// the same peer id (reconnect race).
+static WS_CONN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 // Store punch hole requests
 use once_cell::sync::Lazy;
@@ -88,8 +92,9 @@ pub struct RendezvousServer {
     // because delivering a punch-hole notification to a peer that only ever
     // registers over TCP/WS (never UDP) previously always went out via the
     // UDP-only io_loop socket (Data::Msg) and silently vanished — see
-    // deliver_to_peer().
-    ws_peers: Arc<Mutex<HashMap<String, Sink>>>,
+    // deliver_to_peer(). The u64 is the owning connection's WS_CONN_SEQ id so
+    // cleanup on close only evicts our own entry, not a reconnect's.
+    ws_peers: Arc<Mutex<HashMap<String, (u64, Sink)>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -525,19 +530,46 @@ impl RendezvousServer {
     #[inline]
     async fn deliver_to_peer(&self, id: &str, msg: RendezvousMessage, fallback_addr: SocketAddr) {
         let existing = self.ws_peers.lock().await.remove(id);
-        if let Some(mut sink) = existing {
+        if let Some((conn_id, mut sink)) = existing {
             if let Ok(bytes) = msg.write_to_bytes() {
                 let sent = match &mut sink {
                     Sink::TcpStream(s) => s.send(Bytes::from(bytes)).await.is_ok(),
                     Sink::Ws(ws) => ws.send(tungstenite::Message::Binary(bytes)).await.is_ok(),
                 };
                 if sent {
-                    self.ws_peers.lock().await.insert(id.to_owned(), sink);
+                    // Reinsert only if a newer connection for this peer didn't
+                    // register in the meantime (during our send .await).
+                    let mut map = self.ws_peers.lock().await;
+                    let newer = matches!(map.get(id), Some((cid, _)) if *cid > conn_id);
+                    if !newer {
+                        map.insert(id.to_owned(), (conn_id, sink));
+                    }
                     return;
                 }
             }
         }
         self.tx.send(Data::Msg(msg.into(), fallback_addr)).ok();
+    }
+
+    // Registers this connection's sink under `id` so deliver_to_peer() can push
+    // notifications (and RegisterPeerResponses) to it. Idempotent per
+    // connection: only the first call takes the sink; later messages on the same
+    // connection find `sink` already None but still record `reg_id` for cleanup.
+    #[inline]
+    async fn register_ws_sink(
+        &self,
+        id: &str,
+        conn_id: u64,
+        sink: &mut Option<Sink>,
+        reg_id: &mut Option<String>,
+    ) {
+        *reg_id = Some(id.to_owned());
+        if let Some(s) = sink.take() {
+            self.ws_peers
+                .lock()
+                .await
+                .insert(id.to_owned(), (conn_id, s));
+        }
     }
 
     #[inline]
@@ -548,6 +580,8 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        conn_id: u64,
+        reg_id: &mut Option<String>,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
@@ -624,15 +658,14 @@ impl RendezvousServer {
                     let id = rk.id.clone();
                     match self.handle_register_pk(rk, addr).await {
                         Ok(Some((msg_out, is_ok))) => {
-                            Self::send_to_sink(sink, msg_out).await;
-                            // Keep this connection's sink around keyed by peer id so
-                            // deliver_to_peer() can push punch-hole/relay notifications
-                            // to this peer later, on whatever future connection it's
-                            // still holding open (see ws_peers doc comment).
+                            // Register this connection's sink FIRST so the response
+                            // (and later punch/relay notifications) go out through
+                            // ws_peers by id; the local `sink` is None afterwards.
                             if is_ok {
-                                if let Some(s) = sink.take() {
-                                    self.ws_peers.lock().await.insert(id, s);
-                                }
+                                self.register_ws_sink(&id, conn_id, sink, reg_id).await;
+                                self.deliver_to_peer(&id, msg_out, addr).await;
+                            } else {
+                                Self::send_to_sink(sink, msg_out).await;
                             }
                         }
                         Ok(None) => {}
@@ -646,6 +679,36 @@ impl RendezvousServer {
                     // lookup ran, but the connection closed right after with no clean
                     // WS close handshake). Keep the connection open like PunchHoleRequest
                     // and RequestRelay do, so the client can keep using it afterwards.
+                    return true;
+                }
+                Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                    // The client's periodic keepalive on the rendezvous connection.
+                    // handle_udp answers this (via update_addr) with a
+                    // RegisterPeerResponse; handle_tcp previously fell through to
+                    // `_ => {}` and never replied, so a WS-registered peer's
+                    // keepalive went unanswered and the client tore the connection
+                    // down on its own timeout every ~90s, reconnecting endlessly and
+                    // making the peer intermittently unreachable. Mirror the UDP
+                    // behavior: refresh last_reg_time, keep the sink registered, and
+                    // reply through it.
+                    if !rp.id.is_empty() {
+                        let request_pk = if let Some(peer) =
+                            self.pm.get_in_memory(&rp.id).await
+                        {
+                            let mut w = peer.write().await;
+                            w.last_reg_time = Instant::now();
+                            w.pk.is_empty()
+                        } else {
+                            true
+                        };
+                        self.register_ws_sink(&rp.id, conn_id, sink, reg_id).await;
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_register_peer_response(RegisterPeerResponse {
+                            request_pk,
+                            ..Default::default()
+                        });
+                        self.deliver_to_peer(&rp.id, msg_out, addr).await;
+                    }
                     return true;
                 }
                 _ => {}
@@ -1249,6 +1312,10 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let mut sink;
+        let conn_id = WS_CONN_SEQ.fetch_add(1, Ordering::SeqCst);
+        // Peer id this connection registered under (learned from RegisterPk /
+        // RegisterPeer), used to evict our ws_peers entry on close.
+        let mut reg_id: Option<String> = None;
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
@@ -1276,7 +1343,10 @@ impl RendezvousServer {
             // unreachable for punch-hole delivery far too often.
             while let Ok(Some(Ok(msg))) = timeout(90_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    if !self
+                        .handle_tcp(&bytes, &mut sink, addr, key, ws, conn_id, &mut reg_id)
+                        .await
+                    {
                         break;
                     }
                 }
@@ -1285,13 +1355,24 @@ impl RendezvousServer {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                if !self
+                    .handle_tcp(&bytes, &mut sink, addr, key, ws, conn_id, &mut reg_id)
+                    .await
+                {
                     break;
                 }
             }
         }
         if sink.is_none() {
             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        }
+        // Evict this peer's registered sink, but only if it's still ours — a
+        // reconnect may have already replaced it with a newer connection.
+        if let Some(id) = reg_id {
+            let mut map = self.ws_peers.lock().await;
+            if matches!(map.get(&id), Some((cid, _)) if *cid == conn_id) {
+                map.remove(&id);
+            }
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
