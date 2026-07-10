@@ -521,6 +521,23 @@ impl RendezvousServer {
         Ok(Some((msg_out, true)))
     }
 
+    // The client's WS/TCP rendezvous loop (start_tcp in rendezvous_mediator.rs)
+    // self-disconnects with "Rendezvous connection is timeout" if it hasn't
+    // received *anything* — a real message or an empty binary WS frame used
+    // purely as a heartbeat ping — within keep_alive*1.5 (90s, DEFAULT_KEEP_ALIVE
+    // = 60s). hbbs never sent that heartbeat, so every WS-registered client's
+    // rendezvous connection reset itself every ~90s regardless of any of the
+    // above fixes (confirmed: matched the observed 90s cycle exactly). An empty
+    // RendezvousMessage serializes to zero bytes, which is exactly the frame the
+    // client is watching for (see its `if bytes.is_empty() { ...; continue }`).
+    #[inline]
+    async fn send_ws_heartbeat(&self, addr: SocketAddr, reg_id: &Option<String>, sink: &mut Option<Sink>) {
+        match reg_id {
+            Some(id) => self.deliver_to_peer(id, RendezvousMessage::new(), addr).await,
+            None => Self::send_to_sink(sink, RendezvousMessage::new()).await,
+        }
+    }
+
     // Sends `msg` to peer `id`'s live TCP/WS connection if it has one (the
     // normal case for our WS-only clients), falling back to the legacy
     // UDP-only Data::Msg delivery (io_loop's socket.send) otherwise — that
@@ -1341,13 +1358,31 @@ impl RendezvousServer {
             // this connection stays open, so closing it after the same 30s idle
             // timeout as a one-shot TCP punch/relay exchange made registered peers
             // unreachable for punch-hole delivery far too often.
-            while let Ok(Some(Ok(msg))) = timeout(90_000, b.next()).await {
-                if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self
-                        .handle_tcp(&bytes, &mut sink, addr, key, ws, conn_id, &mut reg_id)
-                        .await
-                    {
-                        break;
+            //
+            // heartbeat_timer fires well under the client's 90s self-timeout
+            // (DEFAULT_KEEP_ALIVE*1.5) so send_ws_heartbeat() can keep resetting it —
+            // see that function's doc comment for why this is required at all.
+            let mut heartbeat_timer = interval(Duration::from_secs(40));
+            heartbeat_timer.tick().await; // first tick fires immediately; consume it
+            'ws_loop: loop {
+                tokio::select! {
+                    next = timeout(90_000, b.next()) => {
+                        match next {
+                            Ok(Some(Ok(msg))) => {
+                                if let tungstenite::Message::Binary(bytes) = msg {
+                                    if !self
+                                        .handle_tcp(&bytes, &mut sink, addr, key, ws, conn_id, &mut reg_id)
+                                        .await
+                                    {
+                                        break 'ws_loop;
+                                    }
+                                }
+                            }
+                            _ => break 'ws_loop,
+                        }
+                    }
+                    _ = heartbeat_timer.tick() => {
+                        self.send_ws_heartbeat(addr, &reg_id, &mut sink).await;
                     }
                 }
             }
