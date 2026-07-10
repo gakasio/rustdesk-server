@@ -873,7 +873,14 @@ impl RendezvousServer {
                 let r = peer.read().await;
                 (r.last_reg_time.elapsed().as_millis() as i32, r.socket_addr)
             };
-            if elapsed >= REG_TIMEOUT {
+            // A WS/TCP-registered peer stops resending RegisterPk once its key is
+            // confirmed (see start_tcp in rendezvous_mediator.rs), so last_reg_time
+            // goes stale even though the connection — kept alive only by our
+            // heartbeat, see send_ws_heartbeat() — is still very much online. Its
+            // presence in ws_peers is itself the liveness signal in that case, so
+            // don't fall back to the UDP-oriented last_reg_time staleness check.
+            let ws_online = self.ws_peers.lock().await.contains_key(&id);
+            if elapsed >= REG_TIMEOUT && !ws_online {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
                     failure: punch_hole_response::Failure::OFFLINE.into(),
